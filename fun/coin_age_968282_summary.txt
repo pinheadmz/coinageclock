@@ -1,0 +1,27 @@
+==============================================================
+Block:           968282  (0000000000000000…)
+Time (UTC):      2026-09-23T14:22:04+00:00
+Transactions:    3622  (coinbase excluded from inputs)
+Inputs analyzed: 7602
+Missing prevout: 0
+==============================================================
+
+Coin age (blocks):
+  min:                0
+  median:          49.0
+  mean:         9,271.4
+  max:          475,237
+  stdev:       28,558.5
+
+Distribution:
+  same block (0 blocks)            933  ( 12.3%)  ######
+  < 1 day  (< 144 blk)            3831  ( 50.4%)  #########################
+  1 day – 1 week                  1082  ( 14.2%)  #######
+  1 week – 1 month                 521  (  6.9%)  ###
+  1 month – 6 months               254  (  3.3%)  #
+  6 months – 1 year                251  (  3.3%)  #
+  > 1 year                         730  (  9.6%)  ####
+
+Total input value:  57668.31854463 BTC  (7602 inputs)
+  smallest input:   0.00000240 BTC
+  largest input:    48350.00018310 BTC

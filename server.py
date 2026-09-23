@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""
+Live Bitcoin mempool coin-age dashboard server.
+
+Reads ~/.bitcoin/.cookie for RPC auth.
+Connects to Bitcoin Core RPC on 127.0.0.1:8332.
+Subscribes to ZMQ hashblock + hashtx on tcp://127.0.0.1:21000.
+Serves the coin-age clock at http://0.0.0.0:8080.
+"""
+
+import asyncio
+import base64
+import hashlib
+import io
+import logging
+import pathlib
+import struct
+from dataclasses import dataclass, field
+
+import aiohttp
+from aiohttp import web
+import zmq
+import zmq.asyncio
+
+log = logging.getLogger("mempool")
+
+# ── Cookie auth ──────────────────────────────────────────────────────────────
+
+def read_cookie(path="~/.bitcoin/.cookie") -> dict:
+    """Return an Authorization header dict for Bitcoin Core cookie auth."""
+    p = pathlib.Path(path).expanduser()
+    encoded = base64.b64encode(p.read_text().strip().encode()).decode()
+    return {"Authorization": f"Basic {encoded}"}
+
+# ── Bitcoin RPC client ───────────────────────────────────────────────────────
+
+class BitcoinRPC:
+    def __init__(self, session: aiohttp.ClientSession, auth_headers: dict,
+                 url: str = "http://127.0.0.1:8332/"):
+        self._session = session
+        self._auth_headers = auth_headers
+        self._url = url
+        self._id = 0
+
+    async def call(self, method: str, params: list = None):
+        self._id += 1
+        payload = {"jsonrpc": "2.0", "id": self._id,
+                   "method": method, "params": params or []}
+        async with self._session.post(self._url, json=payload,
+                                      headers=self._auth_headers) as resp:
+            data = await resp.json(content_type=None)
+        if data.get("error"):
+            raise RuntimeError(f"RPC {method}: {data['error']}")
+        return data["result"]
+
+    async def getblockcount(self) -> int:
+        return await self.call("getblockcount")
+
+    async def getrawmempool(self, verbose: bool = False):
+        return await self.call("getrawmempool", [verbose])
+
+    async def getrawtransaction(self, txid: str):
+        return await self.call("getrawtransaction", [txid, True])
+
+    async def gettxout(self, txid: str, vout: int, include_mempool: bool = True):
+        return await self.call("gettxout", [txid, vout, include_mempool])
+
+# ── Coin-age bucketing ───────────────────────────────────────────────────────
+
+ALL_BUCKETS = (
+    ["mempool"]
+    + [str(i) for i in range(1, 11)]
+    + ["10_20", "20_50", "50_100", "100_1000", "1000_plus"]
+)
+
+def age_to_bucket(confs: int) -> str:
+    if confs <= 10:    return str(confs)
+    if confs <= 20:    return "10_20"
+    if confs <= 50:    return "20_50"
+    if confs <= 100:   return "50_100"
+    if confs <= 1000:  return "100_1000"
+    return "1000_plus"
+
+# ── Mempool state ────────────────────────────────────────────────────────────
+
+def _empty_buckets():
+    return {k: {"inputs": 0, "btc": 0.0, "txs": 0} for k in ALL_BUCKETS}
+
+@dataclass
+class MempoolState:
+    tip_height:  int  = 0
+    scanning:    bool = True
+    scan_done:   int  = 0
+    scan_total:  int  = 0
+    generation:  int  = 0    # bumped on every block; lets in-progress scans self-cancel
+    known_txids: set  = field(default_factory=set)
+    # txid → [(bucket_key, btc), ...]  — one entry per non-coinbase input
+    tx_inputs:   dict = field(default_factory=dict)
+    buckets:     dict = field(default_factory=_empty_buckets)
+
+    def reset(self):
+        """Wipe mempool state. Call after every block confirmation."""
+        self.known_txids.clear()
+        self.tx_inputs.clear()
+        self.buckets   = _empty_buckets()
+        self.scanning  = True
+        self.scan_done = 0
+        self.scan_total = 0
+        self.generation += 1   # signals any running scan to stop
+
+    def add_tx(self, txid: str, inputs: list) -> bool:
+        """Return True if newly added (False if already known)."""
+        if txid in self.tx_inputs:
+            return False
+        self.known_txids.add(txid)
+        self.tx_inputs[txid] = inputs
+        tx_counted = False
+        for bucket, btc in inputs:
+            b = self.buckets[bucket]
+            b["inputs"] += 1
+            b["btc"]    += btc
+            if not tx_counted:
+                b["txs"] += 1
+                tx_counted = True
+        return True
+
+    def remove_tx(self, txid: str):
+        """Remove a transaction (e.g. confirmed in a block)."""
+        self.known_txids.discard(txid)
+        inputs = self.tx_inputs.pop(txid, None)
+        if not inputs:
+            return
+        tx_counted = False
+        for bucket, btc in inputs:
+            b = self.buckets[bucket]
+            b["inputs"] = max(0, b["inputs"] - 1)
+            b["btc"]    = max(0.0, b["btc"] - btc)
+            if not tx_counted:
+                b["txs"] = max(0, b["txs"] - 1)
+                tx_counted = True
+
+    def to_snapshot(self) -> dict:
+        return {
+            "type":             "state",
+            "tip_height":       self.tip_height,
+            "mempool_tx_count": len(self.known_txids),
+            "scanning":         self.scanning,
+            "scan_done":        self.scan_done,
+            "scan_total":       self.scan_total,
+            "buckets":          {k: dict(v) for k, v in self.buckets.items()},
+        }
+
+# ── Raw transaction parsing ───────────────────────────────────────────────────
+
+def _varint(f: io.BytesIO) -> int:
+    b = f.read(1)[0]
+    if b < 0xfd: return b
+    if b == 0xfd: return struct.unpack('<H', f.read(2))[0]
+    if b == 0xfe: return struct.unpack('<I', f.read(4))[0]
+    return struct.unpack('<Q', f.read(8))[0]
+
+def _varint_bytes(n: int) -> bytes:
+    if n < 0xfd: return bytes([n])
+    if n < 0x10000: return b'\xfd' + struct.pack('<H', n)
+    if n < 0x100000000: return b'\xfe' + struct.pack('<I', n)
+    return b'\xff' + struct.pack('<Q', n)
+
+def parse_raw_tx(raw: bytes):
+    """
+    Parse a raw Bitcoin transaction (segwit-aware).
+    Returns (txid_hex, vin_list) where vin_list is [(prev_txid_hex, vout), ...].
+    Coinbase inputs are represented as (None, None) and should be filtered out.
+    """
+    f = io.BytesIO(raw)
+    version_b = f.read(4)
+
+    # Segwit marker check
+    marker = f.read(1)
+    segwit = marker == b'\x00'
+    if segwit:
+        f.read(1)  # flag byte
+    else:
+        f.seek(-1, 1)  # put back non-marker byte
+
+    # Inputs
+    n_in = _varint(f)
+    vin = []
+    vin_serial = b''
+    for _ in range(n_in):
+        prev_hash = f.read(32)          # little-endian txid
+        prev_idx  = f.read(4)
+        slen      = _varint(f)
+        script    = f.read(slen)
+        seq       = f.read(4)
+        vin_serial += prev_hash + prev_idx + _varint_bytes(slen) + script + seq
+
+        if prev_hash == b'\x00' * 32:   # coinbase
+            vin.append((None, None))
+        else:
+            vin.append((prev_hash[::-1].hex(), struct.unpack('<I', prev_idx)[0]))
+
+    # Outputs
+    n_out = _varint(f)
+    out_serial = b''
+    for _ in range(n_out):
+        value  = f.read(8)
+        slen   = _varint(f)
+        script = f.read(slen)
+        out_serial += value + _varint_bytes(slen) + script
+
+    # Skip witness data (segwit only) — not included in txid hash
+    if segwit:
+        for _ in range(n_in):
+            stack_items = _varint(f)
+            for _ in range(stack_items):
+                item_len = _varint(f)
+                f.read(item_len)
+
+    locktime_b = f.read(4)
+
+    # txid = double-SHA256 of the non-witness serialisation
+    nowitness = (version_b +
+                 _varint_bytes(n_in) + vin_serial +
+                 _varint_bytes(n_out) + out_serial +
+                 locktime_b)
+    txid = hashlib.sha256(hashlib.sha256(nowitness).digest()).digest()[::-1].hex()
+
+    return txid, vin
+
+# ── UTXO age lookup (shared by initial scan and live ZMQ path) ────────────────
+
+async def classify_vin(vin: list, rpc: BitcoinRPC,
+                       state: MempoolState) -> list:
+    """
+    Given a vin list of (prev_txid, prev_vout) pairs, return
+    [(bucket_key, btc), ...] for every non-coinbase input.
+
+    gettxout semantics (from Bitcoin Core docs):
+      include_mempool=False  →  confirmed UTXO set only, but returns the coin
+        even if it is currently being spent in the mempool. Correct for most
+        mempool inputs (confirmed coins being spent).
+      include_mempool=True   →  "an unspent output that is spent in the mempool
+        won't appear." This makes it useless for the common case AND for CPFP
+        chains where the child is spending the parent's output (both in mempool).
+    So we use False first, then fall back to state.known_txids for CPFP.
+    """
+    inputs = []
+    for in_txid, in_vout in vin:
+        if in_txid is None:     # coinbase input
+            continue
+
+        # Pass 1: confirmed UTXO (works for the vast majority of mempool inputs)
+        try:
+            utxo = await rpc.gettxout(in_txid, in_vout, include_mempool=False)
+        except Exception as exc:
+            log.debug("gettxout %s:%d: %s", in_txid[:16], in_vout, exc)
+            utxo = None
+
+        if utxo is not None:
+            inputs.append((age_to_bucket(utxo.get("confirmations", 1)),
+                           utxo.get("value", 0.0)))
+            continue
+
+        # Pass 2: gettxout returned null — could be CPFP (parent also in mempool).
+        # Both include_mempool=True and False return null when the output is being
+        # spent in the mempool, so we check known_txids to identify CPFP parents.
+        if in_txid in state.known_txids:
+            # Parent is a mempool tx; get the value if possible, else 0.
+            try:
+                utxo = await rpc.gettxout(in_txid, in_vout, include_mempool=True)
+            except Exception:
+                utxo = None
+            btc = utxo.get("value", 0.0) if utxo else 0.0
+            inputs.append(("mempool", btc))
+        else:
+            log.debug("UTXO not found %s:%d", in_txid[:16], in_vout)
+
+    return inputs
+
+async def classify_tx(txid: str, rpc: BitcoinRPC,
+                      state: MempoolState) -> list:
+    """Fetch tx via RPC then classify its inputs. Used by the initial scan."""
+    try:
+        tx = await rpc.getrawtransaction(txid)
+    except Exception as exc:
+        # Tx may have been confirmed while the slow initial scan was still running.
+        log.debug("getrawtransaction %s: %s", txid[:16], exc)
+        return []
+    vin = [(v["txid"], v["vout"]) if "txid" in v else (None, None)
+           for v in tx.get("vin", [])]
+    return await classify_vin(vin, rpc, state)
+
+# ── Initial mempool scan ──────────────────────────────────────────────────────
+
+async def initial_scan(rpc: BitcoinRPC, state: MempoolState, broadcast_fn):
+    gen = state.generation   # snapshot — if this changes, a new block arrived
+    log.info("Starting mempool scan (generation %d)…", gen)
+    try:
+        raw = await rpc.getrawmempool(verbose=True)
+    except Exception as exc:
+        log.error("getrawmempool failed: %s", exc)
+        state.scanning = False
+        await broadcast_fn()
+        return
+
+    if state.generation != gen:
+        log.info("Scan %d superseded before it started", gen)
+        return
+
+    # Register all txids first so mempool-spend detection works from the start.
+    state.known_txids = set(raw)
+    state.scan_total  = len(raw)
+    log.info("Mempool contains %d transactions", state.scan_total)
+
+    # Topological order: process txs with no unconfirmed parents first.
+    no_deps  = [t for t, v in raw.items() if not v.get("depends")]
+    has_deps = [t for t, v in raw.items() if     v.get("depends")]
+    ordered  = no_deps + has_deps
+
+    BATCH = 20
+    for i, txid in enumerate(ordered):
+        if state.generation != gen:          # new block arrived — stop early
+            log.info("Scan %d cancelled at %d/%d", gen, i, state.scan_total)
+            return
+        inputs = await classify_tx(txid, rpc, state)
+        state.add_tx(txid, inputs)
+        state.scan_done = i + 1
+        if (i + 1) % BATCH == 0:
+            await broadcast_fn()
+            await asyncio.sleep(0)
+
+    if state.generation != gen:
+        log.info("Scan %d cancelled at completion", gen)
+        return
+
+    state.scanning  = False
+    state.scan_done = state.scan_total
+    await broadcast_fn()
+    log.info("Scan %d complete.", gen)
+
+# ── ZMQ listener ──────────────────────────────────────────────────────────────
+
+async def _handle_new_tx(txid: str, vin_or_none, rpc: BitcoinRPC,
+                         state: MempoolState):
+    """
+    Classify and broadcast a new mempool tx.
+    vin_or_none: pre-parsed vin list (from rawtx) or None (fetch via RPC for hashtx).
+    Returns True if a new tx was added and broadcast.
+    """
+    # tx_inputs (not known_txids) for dedup: known_txids is pre-loaded by the
+    # initial scan, so buffered ZMQ events for existing txs would all be skipped.
+    # tx_inputs only contains txids we have actually classified.
+    if txid in state.tx_inputs:
+        return False
+
+    if vin_or_none is not None:
+        inputs = await classify_vin(vin_or_none, rpc, state)
+    else:
+        inputs = await classify_tx(txid, rpc, state)   # fetches via getrawtransaction
+
+    if not state.add_tx(txid, inputs):
+        return False  # scan beat us to it
+
+    log.debug("+tx  total=%d  inputs=%d  buckets=%s",
+             len(state.known_txids), len(inputs),
+             sorted({b for b, _ in inputs}) or ["coinbase"])
+    await broadcast_tx(state, inputs)
+    return True
+
+
+async def zmq_listener(state: MempoolState, rpc: BitcoinRPC,
+                       zmq_url: str = "tcp://127.0.0.1:21001"):
+    ctx  = zmq.asyncio.Context()
+    sock = ctx.socket(zmq.SUB)
+    sock.connect(zmq_url)
+    # Subscribe to both variants — whichever the node is configured to publish.
+    # rawtx  → full serialised tx bytes; we parse the vin inline (no extra RPC).
+    # hashtx → just the 32-byte txid hash; we fetch the tx via getrawtransaction.
+    sock.subscribe(b"rawtx")
+    sock.subscribe(b"hashtx")
+    sock.subscribe(b"hashblock")
+    log.info("ZMQ connected to %s (topics: rawtx, hashtx, hashblock)", zmq_url)
+
+    while True:
+        parts = await sock.recv_multipart()
+        topic = parts[0]
+        body  = parts[1]
+
+        if topic == b"rawtx":
+            try:
+                txid, vin = parse_raw_tx(body)
+            except Exception as exc:
+                log.warning("parse_raw_tx failed: %s", exc)
+                continue
+            await _handle_new_tx(txid, vin, rpc, state)
+
+        elif topic == b"hashtx":
+            # Body is the 32-byte txid in internal byte order — reverse for display.
+            txid = body[::-1].hex()
+            await _handle_new_tx(txid, None, rpc, state)
+
+        elif topic == b"hashblock":
+            blkhash = body[::-1].hex()
+            log.info("New block: %s…", blkhash[:16])
+            try:
+                state.tip_height = await rpc.getblockcount()
+            except Exception as exc:
+                log.error("getblockcount: %s", exc)
+
+            # All confirmation depths shift by 1 — buckets are stale.
+            # Wipe everything and rescan; generation bump cancels any running scan.
+            state.reset()
+            log.info("State wiped for block at height %d (gen %d)",
+                     state.tip_height, state.generation)
+
+            await broadcast_block(state)   # tells client to clear wires
+
+            # Rescan the mempool with fresh confirmations
+            asyncio.create_task(
+                initial_scan(rpc, state, lambda: broadcast_all(state))
+            )
+
+# ── WebSocket management ───────────────────────────────────────────────────────
+
+_clients: set = set()
+
+async def ws_handler(request: web.Request) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+    _clients.add(ws)
+    log.info("WS client connected (%d total)", len(_clients))
+    state: MempoolState = request.app["state"]
+    try:
+        await ws.send_json(state.to_snapshot())
+        async for _ in ws:
+            pass  # no client→server messages needed
+    finally:
+        _clients.discard(ws)
+        log.info("WS client disconnected (%d total)", len(_clients))
+    return ws
+
+async def _send_all(msg: dict):
+    if not _clients:
+        return
+    await asyncio.gather(
+        *(ws.send_json(msg) for ws in list(_clients)),
+        return_exceptions=True,
+    )
+
+async def broadcast_all(state: MempoolState):
+    await _send_all(state.to_snapshot())
+
+async def broadcast_tx(state: MempoolState, inputs: list):
+    """Broadcast a state snapshot augmented with the new tx's per-input data."""
+    msg = state.to_snapshot()
+    msg["new_inputs"] = [{"bucket": b, "btc": btc} for b, btc in inputs]
+    await _send_all(msg)
+
+async def broadcast_block(state: MempoolState):
+    """Broadcast a state snapshot flagged as a block change."""
+    msg = state.to_snapshot()
+    msg["block_change"] = True
+    await _send_all(msg)
+
+# ── Periodic heartbeat (catches clients that connect during quiet periods) ────
+
+async def heartbeat_loop(app: web.Application):
+    while True:
+        await asyncio.sleep(2.0)
+        if _clients:
+            await broadcast_all(app["state"])
+
+# ── App lifecycle ──────────────────────────────────────────────────────────────
+
+async def on_startup(app: web.Application):
+    auth_headers = read_cookie()
+    # Persistent keep-alive connections to the local node — avoids TCP handshake
+    # overhead on every RPC call (critical during the initial mempool scan).
+    connector = aiohttp.TCPConnector(limit=8, keepalive_timeout=30.0)
+    session   = aiohttp.ClientSession(connector=connector)
+    rpc       = BitcoinRPC(session, auth_headers)
+    state     = MempoolState()
+
+    app["session"] = session
+    app["rpc"]     = rpc
+    app["state"]   = state
+
+    state.tip_height = await rpc.getblockcount()
+    log.info("Tip height: %d", state.tip_height)
+
+    asyncio.create_task(zmq_listener(state, rpc))
+    asyncio.create_task(heartbeat_loop(app))
+    asyncio.create_task(initial_scan(rpc, state,
+                                     lambda: broadcast_all(app["state"])))
+
+async def on_cleanup(app: web.Application):
+    if "session" in app:
+        await app["session"].close()
+
+# ── Routing + entry point ─────────────────────────────────────────────────────
+
+def build_app() -> web.Application:
+    app = web.Application()
+    static_dir = pathlib.Path(__file__).parent / "static"
+    app.router.add_get("/ws", ws_handler)
+    app.router.add_get("/", lambda r: web.FileResponse(static_dir / "index.html"))
+    app.router.add_static("/static", static_dir, show_index=False)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-7s  %(message)s",
+    )
+    web.run_app(build_app(), host="0.0.0.0", port=8080)

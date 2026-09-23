@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bitcoin Mempool — Coin Age Clock</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #020810;
+    color: #cbd5e1;
+    font-family: "Courier New", monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px 24px 32px;
+    min-height: 100vh;
+  }
+
+  h1 {
+    color: #e2e8f0;
+    font-size: 16px;
+    letter-spacing: .04em;
+    margin-bottom: 6px;
+  }
+
+  /* ── Status bar ── */
+  #status-bar {
+    font-size: 11px;
+    color: #334155;
+    margin-bottom: 18px;
+    display: flex;
+    gap: 18px;
+    align-items: center;
+  }
+  #conn-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #ef4444;  /* red = disconnected */
+    transition: background .3s;
+  }
+  #conn-dot.live     { background: #22c55e; }
+  #conn-dot.scanning { background: #eab308; }
+
+  /* ── Scan progress bar ── */
+  #scan-wrap {
+    width: 100%;
+    max-width: 900px;
+    margin-bottom: 12px;
+    display: none;
+  }
+  #scan-wrap.visible { display: block; }
+  #scan-label { font-size: 10px; color: #475569; margin-bottom: 4px; }
+  #scan-bar-bg {
+    height: 3px;
+    background: #0f1d30;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  #scan-bar {
+    height: 100%;
+    background: #eab308;
+    border-radius: 2px;
+    width: 0%;
+    transition: width .4s;
+  }
+
+  /* ── SVG container ── */
+  #viz-wrap {
+    width: 100%;
+    max-width: 1320px;
+  }
+  #clock-svg {
+    width: 100%;
+    height: auto;
+    display: block;
+    border-radius: 14px;
+  }
+
+  /* ── Summary table ── */
+  #table-wrap {
+    margin-top: 28px;
+    width: 100%;
+    max-width: 860px;
+  }
+  #table-wrap h2 {
+    font-size: 10px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: #1e3a5f;
+    margin-bottom: 10px;
+  }
+  table {
+    border-collapse: collapse;
+    font-size: 12px;
+    width: 100%;
+  }
+  th {
+    color: #1e3a5f;
+    font-size: 10px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    padding: 5px 16px 5px 0;
+    border-bottom: 1px solid #080f1e;
+    text-align: right;
+  }
+  th:first-child { text-align: left; }
+  td {
+    padding: 5px 16px 5px 0;
+    text-align: right;
+    color: #334155;
+    border-bottom: 1px solid #060d1a;
+  }
+  td:first-child { text-align: left; font-weight: bold; }
+  tr:hover td { background: #080f1c; }
+</style>
+</head>
+<body>
+
+<h1>Bitcoin Mempool — Coin Age Clock</h1>
+
+<div id="status-bar">
+  <span><span id="conn-dot"></span> <span id="conn-label">connecting…</span></span>
+  <span>mempool: <span id="stat-txcount">—</span> txs</span>
+  <span>tip: #<span id="stat-tip">—</span></span>
+  <span>updated: <span id="stat-age">—</span></span>
+</div>
+
+<div id="scan-wrap">
+  <div id="scan-label">Scanning mempool… <span id="scan-progress"></span></div>
+  <div id="scan-bar-bg"><div id="scan-bar"></div></div>
+</div>
+
+<div id="viz-wrap">
+  <!-- SVG is created and owned by viz.js -->
+</div>
+
+<div id="table-wrap">
+  <h2>By source</h2>
+  <table id="summary-table">
+    <thead>
+      <tr>
+        <th>Age (blocks)</th>
+        <th style="text-align:right">Inputs</th>
+        <th style="text-align:right">Txs</th>
+        <th style="text-align:right">Total BTC</th>
+      </tr>
+    </thead>
+    <tbody id="table-body"></tbody>
+  </table>
+</div>
+
+<script src="/static/viz.js"></script>
+</body>
+</html>
