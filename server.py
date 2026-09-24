@@ -496,7 +496,10 @@ async def zmq_listener(state: MempoolState, rpc: BitcoinRPC,
             await _handle_new_tx(txid, None, rpc, state)
 
         elif topic == b"hashblock":
-            blkhash = body[::-1].hex()
+            # hashblock ZMQ sends the hash already in display (big-endian) byte
+            # order — the notifier reverses bytes before publishing, unlike hashtx
+            # which sends in internal (little-endian) order.
+            blkhash = body.hex()
             log.info("New block: %s…", blkhash[:16])
             try:
                 state.tip_height = await rpc.getblockcount()
