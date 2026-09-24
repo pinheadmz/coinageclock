@@ -107,24 +107,31 @@ class MempoolState:
     block_histograms: dict = field(default_factory=dict)
 
     def reset(self):
-        """Wipe mempool state. Call after every block confirmation."""
+        """Full wipe — used only on startup if needed."""
         self.known_txids.clear()
         self.tx_inputs.clear()
-        self.buckets   = _empty_buckets()
-        self.scanning  = True
-        self.scan_done = 0
+        self.buckets    = _empty_buckets()
+        self.scanning   = True
+        self.scan_done  = 0
         self.scan_total = 0
-        self.generation += 1   # signals any running scan to stop
+        self.generation += 1
+
+    # ── tx_inputs stores (confs: int, btc: float) per input ──────────────────
+    # confs = 0   → unconfirmed parent (mempool spend)
+    # confs > 0   → confirmed UTXO, age in blocks
+
+    def _bucket(self, confs: int) -> str:
+        return "mempool" if confs == 0 else age_to_bucket(confs)
 
     def add_tx(self, txid: str, inputs: list) -> bool:
-        """Return True if newly added (False if already known)."""
+        """inputs: [(confs, btc), …]. Returns True if newly added."""
         if txid in self.tx_inputs:
             return False
         self.known_txids.add(txid)
         self.tx_inputs[txid] = inputs
         tx_counted = False
-        for bucket, btc in inputs:
-            b = self.buckets[bucket]
+        for confs, btc in inputs:
+            b = self.buckets[self._bucket(confs)]
             b["inputs"] += 1
             b["btc"]    += btc
             if not tx_counted:
@@ -133,19 +140,52 @@ class MempoolState:
         return True
 
     def remove_tx(self, txid: str):
-        """Remove a transaction (e.g. confirmed in a block)."""
         self.known_txids.discard(txid)
         inputs = self.tx_inputs.pop(txid, None)
         if not inputs:
             return
         tx_counted = False
-        for bucket, btc in inputs:
-            b = self.buckets[bucket]
+        for confs, btc in inputs:
+            b = self.buckets[self._bucket(confs)]
             b["inputs"] = max(0, b["inputs"] - 1)
             b["btc"]    = max(0.0, b["btc"] - btc)
             if not tx_counted:
                 b["txs"] = max(0, b["txs"] - 1)
                 tx_counted = True
+
+    def shift_block(self, confirmed: set):
+        """
+        Efficiently handle a new block without rescanning the entire mempool.
+
+        1. Remove confirmed txids (≈1-2k on mainnet).
+        2. For every surviving tx, increment each input's confs by 1.
+           Coins cross age-bucket boundaries (e.g. confs 10→11 moves "10"→"10_20")
+           correctly because we store exact confirmation counts rather than buckets.
+        3. Rebuild the bucket totals in a single O(surviving_inputs) pass.
+        """
+        for txid in confirmed:
+            self.remove_tx(txid)
+
+        # Shift all surviving inputs +1 block and recompute buckets in one pass
+        surviving     = self.tx_inputs
+        self.tx_inputs = {}
+        self.buckets   = _empty_buckets()
+        self.known_txids.clear()
+
+        for txid, inputs in surviving.items():
+            new_inputs  = []
+            tx_counted  = False
+            for confs, btc in inputs:
+                new_confs = confs + 1 if confs > 0 else 0  # mempool parents stay 0
+                new_inputs.append((new_confs, btc))
+                b = self.buckets[self._bucket(new_confs)]
+                b["inputs"] += 1
+                b["btc"]    += btc
+                if not tx_counted:
+                    b["txs"] += 1
+                    tx_counted = True
+            self.tx_inputs[txid] = new_inputs
+            self.known_txids.add(txid)
 
     def to_snapshot(self) -> dict:
         return {
@@ -248,24 +288,17 @@ def parse_raw_tx(raw: bytes):
 async def classify_vin(vin: list, rpc: BitcoinRPC,
                        state: MempoolState) -> list:
     """
-    Given a vin list of (prev_txid, prev_vout) pairs, return
-    [(bucket_key, btc), ...] for every non-coinbase input.
-
-    gettxout semantics (from Bitcoin Core docs):
-      include_mempool=False  →  confirmed UTXO set only, but returns the coin
-        even if it is currently being spent in the mempool. Correct for most
-        mempool inputs (confirmed coins being spent).
-      include_mempool=True   →  "an unspent output that is spent in the mempool
-        won't appear." This makes it useless for the common case AND for CPFP
-        chains where the child is spending the parent's output (both in mempool).
-    So we use False first, then fall back to state.known_txids for CPFP.
+    Returns [(confs, btc), …] — stores exact confirmation counts, not bucket strings.
+    confs=0 means the parent UTXO is itself unconfirmed (CPFP / mempool-to-mempool).
+    Storing exact confs lets shift_block() correctly move coins across bucket
+    boundaries (e.g. confs 10→11 crosses from "10" into "10_20") without re-fetching.
     """
     inputs = []
     for in_txid, in_vout in vin:
-        if in_txid is None:     # coinbase input
+        if in_txid is None:
             continue
 
-        # Pass 1: confirmed UTXO (works for the vast majority of mempool inputs)
+        # Pass 1: confirmed UTXO
         try:
             utxo = await rpc.gettxout(in_txid, in_vout, include_mempool=False)
         except Exception as exc:
@@ -273,21 +306,16 @@ async def classify_vin(vin: list, rpc: BitcoinRPC,
             utxo = None
 
         if utxo is not None:
-            inputs.append((age_to_bucket(utxo.get("confirmations", 1)),
-                           utxo.get("value", 0.0)))
+            inputs.append((utxo.get("confirmations", 1), utxo.get("value", 0.0)))
             continue
 
-        # Pass 2: gettxout returned null — could be CPFP (parent also in mempool).
-        # Both include_mempool=True and False return null when the output is being
-        # spent in the mempool, so we check known_txids to identify CPFP parents.
+        # Pass 2: CPFP — parent is in the mempool
         if in_txid in state.known_txids:
-            # Parent is a mempool tx; get the value if possible, else 0.
             try:
                 utxo = await rpc.gettxout(in_txid, in_vout, include_mempool=True)
             except Exception:
                 utxo = None
-            btc = utxo.get("value", 0.0) if utxo else 0.0
-            inputs.append(("mempool", btc))
+            inputs.append((0, utxo.get("value", 0.0) if utxo else 0.0))
         else:
             log.debug("UTXO not found %s:%d", in_txid[:16], in_vout)
 
@@ -378,9 +406,17 @@ async def initial_scan(rpc: BitcoinRPC, state: MempoolState, broadcast_fn):
 
     BATCH = 20
     for i, txid in enumerate(ordered):
-        if state.generation != gen:          # new block arrived — stop early
+        if state.generation != gen:
             log.info("Scan %d cancelled at %d/%d", gen, i, state.scan_total)
             return
+        # Skip txids already in tx_inputs (processed by ZMQ or shift_block already ran)
+        if txid in state.tx_inputs:
+            state.scan_done = i + 1
+            continue
+        # Skip txids removed by shift_block (confirmed in a block mid-scan)
+        if txid not in state.known_txids:
+            state.scan_done = i + 1
+            continue
         inputs = await classify_tx(txid, rpc, state)
         state.add_tx(txid, inputs)
         state.scan_done = i + 1
@@ -422,7 +458,8 @@ async def _handle_new_tx(txid: str, vin_or_none, rpc: BitcoinRPC,
 
     log.debug("+tx  total=%d  inputs=%d  buckets=%s",
              len(state.known_txids), len(inputs),
-             sorted({b for b, _ in inputs}) or ["coinbase"])
+             sorted({"mempool" if c == 0 else age_to_bucket(c) for c, _ in inputs})
+             or ["coinbase"])
     await broadcast_tx(state, inputs)
     return True
 
@@ -463,26 +500,24 @@ async def zmq_listener(state: MempoolState, rpc: BitcoinRPC,
             log.info("New block: %s…", blkhash[:16])
             try:
                 state.tip_height = await rpc.getblockcount()
-                # Fetch the block with undo data to compute the exact histogram
-                block     = await rpc.getblock(blkhash, 3)
-                new_hist  = compute_block_histogram(block)
+
+                # Block histogram from undo data (verbosity=3)
+                block    = await rpc.getblock(blkhash, 3)
+                new_hist = compute_block_histogram(block)
                 state.shift_and_add_histogram(new_hist)
-                log.info("Block histogram: %d inputs classified",
-                         sum(new_hist.values()))
+
+                # Identify confirmed txids, then shift in-place — no rescan needed
+                new_txids = set(await rpc.getrawmempool(verbose=False))
+                confirmed = state.known_txids - new_txids
+                state.shift_block(confirmed)
+                log.info("Block %d: %d confirmed removed, %d surviving, "
+                         "%d histogram inputs",
+                         state.tip_height, len(confirmed),
+                         len(state.tx_inputs), sum(new_hist.values()))
             except Exception as exc:
                 log.error("block handler: %s", exc)
 
-            # All confirmation depths shift by 1 — mempool buckets are stale.
-            # Wipe and rescan; generation bump cancels any running scan.
-            state.reset()
-            log.info("State wiped (height %d, gen %d)",
-                     state.tip_height, state.generation)
-
-            await broadcast_block(state)   # block_histograms included in snapshot
-
-            asyncio.create_task(
-                initial_scan(rpc, state, lambda: broadcast_all(state))
-            )
+            await broadcast_block(state)
 
 # ── WebSocket management ───────────────────────────────────────────────────────
 
@@ -515,9 +550,12 @@ async def broadcast_all(state: MempoolState):
     await _send_all(state.to_snapshot())
 
 async def broadcast_tx(state: MempoolState, inputs: list):
-    """Broadcast a state snapshot augmented with the new tx's per-input data."""
+    """Broadcast state + per-input wire hints (converts stored confs → bucket for client)."""
     msg = state.to_snapshot()
-    msg["new_inputs"] = [{"bucket": b, "btc": btc} for b, btc in inputs]
+    msg["new_inputs"] = [
+        {"bucket": "mempool" if c == 0 else age_to_bucket(c), "btc": btc}
+        for c, btc in inputs
+    ]
     await _send_all(msg)
 
 async def broadcast_block(state: MempoolState):
