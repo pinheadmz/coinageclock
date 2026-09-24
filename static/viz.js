@@ -15,10 +15,34 @@ const SVG_W = 1320, SVG_H = 900;
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 // Top row: ages 1–10, age 10 leftmost
-const BW = 84, BH = 90, TOP_CY = 78;
-const TOP_L = 185, TOP_R = 1270;
+// TOP_CY moved down from 78 → 140 to make room for the per-block histogram bars above.
+const BW = 84, BH = 90, TOP_CY = 140;
+const TOP_L = 185, TOP_R = 1180;   // TOP_R reduced to leave room for the self-spend bar
 const TOP_PIT = (TOP_R - TOP_L) / 9;
 function topCx(age) { return TOP_L + (10 - age) * TOP_PIT; }
+
+// ── Per-block mini histogram ──────────────────────────────────────────────────
+// Each top-row block square gets its own bar chart above it showing the input-age
+// distribution of that specific confirmed block.
+// Bars run LEFT (oldest: 1000+, violet) → RIGHT (newest: age 1, red) → self-spend (white).
+const HIST_TOP  = 6;
+const HIST_BOT  = TOP_CY - BH / 2 - 2;  // y just above block tops
+const HIST_H    = HIST_BOT - HIST_TOP;   // max bar height ≈ 87 px
+
+// Ordered left → right within each mini histogram
+const BAR_ORDER = [
+  '1000_plus','100_1000','50_100','20_50','10_20',  // range buckets (oldest→newest)
+  '10','9','8','7','6','5','4','3','2','1',          // individual age buckets
+  'mempool',                                          // same-block self-spend (white)
+];
+const MINI_BAR_W = Math.floor((BW - 4) / BAR_ORDER.length);  // ≈ 5 px each
+
+function barColor(key) {
+  if (key === 'mempool') return '#f8fafc';
+  const age = parseInt(key, 10);
+  if (!isNaN(age) && String(age) === key) return ageHsl(age);
+  return rangeHsl(key);  // range bucket
+}
 
 // Left column: 5 age-range blocks
 const LC_W = 100, LC_H = 84, LC_CX = 62;
@@ -63,7 +87,7 @@ const RANGE_HUES = {
 };
 function rangeHsl(key, l = 62) { return `hsl(${RANGE_HUES[key]},78%,${l}%)`; }
 
-const SAME_COL    = 'hsl(48,95%,65%)';
+const SAME_COL    = '#f8fafc';
 const MEMPOOL_COL = '#3b82f6';
 
 // Wire appearance is uniform — the visualisation encodes input COUNT, not value.
@@ -116,12 +140,23 @@ function buildSVG() {
   svg.appendChild(linesLayer);
   svg.appendChild(blocksLayer);
 
-  // ── Top-row age blocks ──────────────────────────────────────────────────────
+  // ── Top-row age blocks + histogram bars above them ─────────────────────────
   for (let age = 1; age <= 10; age++) {
     const cx = topCx(age);
     const bx = cx - BW / 2, by = TOP_CY - BH / 2;
     const col = ageHsl(age);
     const g = el('g', { id: `blk-age-${age}` });
+
+    // Mini histogram — 16 thin bars (oldest→newest→self-spend), initially height 0
+    for (let j = 0; j < BAR_ORDER.length; j++) {
+      g.appendChild(el('rect', {
+        id: `hist-${age}-${BAR_ORDER[j]}`,
+        x: bx + 2 + j * MINI_BAR_W, y: HIST_BOT,
+        width: MINI_BAR_W, height: 0,
+        fill: barColor(BAR_ORDER[j]), opacity: 0.85,
+      }));
+    }
+
     g.appendChild(el('rect', { x: bx, y: by, width: BW, height: BH, rx: 6,
       fill: '#080f1c', stroke: col, 'stroke-width': 1.8 }));
     g.appendChild(txt(cx, by + 15, '…',
@@ -345,6 +380,33 @@ function setTxt(id, val) {
   if (e) e.textContent = val;
 }
 
+// ── Block input-age histogram ─────────────────────────────────────────────────
+
+/**
+ * Update the mini histogram above one block square.
+ * hist: {bucket_key → count}  (from block_histograms[age] in the server snapshot)
+ */
+function updateBlockHistogram(age, hist) {
+  if (!hist) return;
+  const counts  = BAR_ORDER.map(k => hist[k] || 0);
+  const maxCount = Math.max(...counts, 1);
+  for (let j = 0; j < BAR_ORDER.length; j++) {
+    const bar = document.getElementById(`hist-${age}-${BAR_ORDER[j]}`);
+    if (!bar) continue;
+    const h = Math.round(HIST_H * counts[j] / maxCount);
+    bar.setAttribute('height', h);
+    bar.setAttribute('y',      HIST_BOT - h);
+  }
+}
+
+/** Update all 10 block histograms from the snapshot's block_histograms map. */
+function updateAllHistograms(blockHistograms) {
+  if (!blockHistograms) return;
+  for (let age = 1; age <= 10; age++) {
+    updateBlockHistogram(age, blockHistograms[String(age)]);
+  }
+}
+
 function updateLabels(data) {
   const tip = data.tip_height || 0;
   const bkts = data.buckets || {};
@@ -458,6 +520,10 @@ function connect() {
     // Labels + table (always)
     updateLabels(data);
     updateTable(data);
+
+    // Per-block histograms: always present in snapshot; update every message so
+    // the display stays current as blocks arrive and ages shift.
+    updateAllHistograms(data.block_histograms);
 
     // ── Wire logic ────────────────────────────────────────────────────────────
     const blockChanged    = _tipHeight !== null && data.tip_height !== _tipHeight;

@@ -65,6 +65,12 @@ class BitcoinRPC:
     async def gettxout(self, txid: str, vout: int, include_mempool: bool = True):
         return await self.call("gettxout", [txid, vout, include_mempool])
 
+    async def getblockhash(self, height: int) -> str:
+        return await self.call("getblockhash", [height])
+
+    async def getblock(self, blockhash: str, verbosity: int = 1):
+        return await self.call("getblock", [blockhash, verbosity])
+
 # ── Coin-age bucketing ───────────────────────────────────────────────────────
 
 ALL_BUCKETS = (
@@ -92,11 +98,13 @@ class MempoolState:
     scanning:    bool = True
     scan_done:   int  = 0
     scan_total:  int  = 0
-    generation:  int  = 0    # bumped on every block; lets in-progress scans self-cancel
-    known_txids: set  = field(default_factory=set)
-    # txid → [(bucket_key, btc), ...]  — one entry per non-coinbase input
-    tx_inputs:   dict = field(default_factory=dict)
-    buckets:     dict = field(default_factory=_empty_buckets)
+    generation:       int  = 0    # bumped on every block; lets in-progress scans self-cancel
+    known_txids:      set  = field(default_factory=set)
+    tx_inputs:        dict = field(default_factory=dict)
+    buckets:          dict = field(default_factory=_empty_buckets)
+    # Per-block input-age histograms: {age_int: {bucket: count}}
+    # age 1 = tip block, age 2 = tip-1, … age 10 = tip-9
+    block_histograms: dict = field(default_factory=dict)
 
     def reset(self):
         """Wipe mempool state. Call after every block confirmation."""
@@ -148,7 +156,15 @@ class MempoolState:
             "scan_done":        self.scan_done,
             "scan_total":       self.scan_total,
             "buckets":          {k: dict(v) for k, v in self.buckets.items()},
+            "block_histograms": {str(age): h for age, h in self.block_histograms.items()},
         }
+
+    def shift_and_add_histogram(self, new_hist: dict):
+        """On every confirmed block: shift ages 1→2, …, 9→10; age 1 = new block."""
+        self.block_histograms = {
+            age + 1: h for age, h in self.block_histograms.items() if age < 10
+        }
+        self.block_histograms[1] = new_hist
 
 # ── Raw transaction parsing ───────────────────────────────────────────────────
 
@@ -290,6 +306,49 @@ async def classify_tx(txid: str, rpc: BitcoinRPC,
            for v in tx.get("vin", [])]
     return await classify_vin(vin, rpc, state)
 
+# ── Block histogram computation ──────────────────────────────────────────────
+
+def compute_block_histogram(block: dict) -> dict:
+    """
+    Compute input-age histogram for a verbosity=3 block dict.
+    Uses prevout.height from the block undo data — no txindex required.
+    age = block_height - prevout.height; age 0 → "mempool" (same-block spend).
+    """
+    H = block["height"]
+    histogram: dict = {}
+    for tx in block.get("tx", []):
+        for vin in tx.get("vin", []):
+            if "coinbase" in vin:
+                continue
+            prevout = vin.get("prevout")
+            if prevout is None:
+                continue          # undo data absent (pruned)
+            age = H - prevout["height"]
+            bucket = "mempool" if age == 0 else age_to_bucket(age)
+            histogram[bucket] = histogram.get(bucket, 0) + 1
+    return histogram
+
+
+async def precompute_block_histograms(rpc: BitcoinRPC, state: MempoolState):
+    """
+    Fetch and compute input-age histograms for the last 10 confirmed blocks
+    so the histogram display is populated immediately on page load.
+    """
+    log.info("Pre-computing block histograms (verbosity=3)…")
+    for age in range(1, 11):
+        block_height = state.tip_height - age + 1
+        try:
+            blockhash = await rpc.getblockhash(block_height)
+            block     = await rpc.getblock(blockhash, 3)
+            hist      = compute_block_histogram(block)
+            state.block_histograms[age] = hist
+            log.info("  #%d (age %d): %d inputs", block_height, age,
+                     sum(hist.values()))
+        except Exception as exc:
+            log.warning("  #%d (age %d): %s", block_height, age, exc)
+    log.info("Block histogram pre-computation done.")
+
+
 # ── Initial mempool scan ──────────────────────────────────────────────────────
 
 async def initial_scan(rpc: BitcoinRPC, state: MempoolState, broadcast_fn):
@@ -404,18 +463,23 @@ async def zmq_listener(state: MempoolState, rpc: BitcoinRPC,
             log.info("New block: %s…", blkhash[:16])
             try:
                 state.tip_height = await rpc.getblockcount()
+                # Fetch the block with undo data to compute the exact histogram
+                block     = await rpc.getblock(blkhash, 3)
+                new_hist  = compute_block_histogram(block)
+                state.shift_and_add_histogram(new_hist)
+                log.info("Block histogram: %d inputs classified",
+                         sum(new_hist.values()))
             except Exception as exc:
-                log.error("getblockcount: %s", exc)
+                log.error("block handler: %s", exc)
 
-            # All confirmation depths shift by 1 — buckets are stale.
-            # Wipe everything and rescan; generation bump cancels any running scan.
+            # All confirmation depths shift by 1 — mempool buckets are stale.
+            # Wipe and rescan; generation bump cancels any running scan.
             state.reset()
-            log.info("State wiped for block at height %d (gen %d)",
+            log.info("State wiped (height %d, gen %d)",
                      state.tip_height, state.generation)
 
-            await broadcast_block(state)   # tells client to clear wires
+            await broadcast_block(state)   # block_histograms included in snapshot
 
-            # Rescan the mempool with fresh confirmations
             asyncio.create_task(
                 initial_scan(rpc, state, lambda: broadcast_all(state))
             )
@@ -457,7 +521,7 @@ async def broadcast_tx(state: MempoolState, inputs: list):
     await _send_all(msg)
 
 async def broadcast_block(state: MempoolState):
-    """Broadcast a state snapshot flagged as a block change."""
+    """Broadcast a state snapshot flagged as a block change (includes block_histograms)."""
     msg = state.to_snapshot()
     msg["block_change"] = True
     await _send_all(msg)
@@ -487,6 +551,9 @@ async def on_startup(app: web.Application):
 
     state.tip_height = await rpc.getblockcount()
     log.info("Tip height: %d", state.tip_height)
+
+    # Pre-compute histograms for the last 10 blocks before opening to connections
+    await precompute_block_histograms(rpc, state)
 
     asyncio.create_task(zmq_listener(state, rpc))
     asyncio.create_task(heartbeat_loop(app))
